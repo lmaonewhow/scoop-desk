@@ -1,0 +1,40 @@
+{
+  "name": "scoop-desk",
+  "version": "0.2.0",
+  "description": "Scoop 桌面商店与环境恢复工具",
+  "author": "ScoopDesk Team",
+  "main": "electron/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "electron:build": "electron-builder"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^29.1.4",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.scoopdesk.app",
+    "productName": "ScoopDesk",
+    "asar": true,
+    "artifactName": "ScoopDesk-${version}.${ext}",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "renderer/**/*",
+      "README.md",
+      "package.json"
+    ],
+    "win": {
+      "artifactName": "ScoopDesk-${version}.${ext}",
+      "target": [
+        {
+          "target": "portable"
+        }
+      ]
+    }
+  }
+}
