@@ -54,6 +54,17 @@ function popBusy(label) {
   }
 }
 
+function logToFile(message, type = 'info') {
+  const time = new Date().toLocaleTimeString()
+  const line = `[${time}] ${message}`
+  appendLogFile(line)
+  if (type === 'error') {
+    console.error(message)
+  } else {
+    console.log(message)
+  }
+}
+
 const DEFAULT_BUCKETS = [
   { name: 'main' },
   { name: 'extras' },
@@ -382,12 +393,14 @@ function setUpdateStatus(message, type = 'info') {
 }
 
 async function checkAppUpdate({ silent = false } = {}) {
+  logToFile('开始检查应用更新...')
   if (!silent) {
     setUpdateStatus('检查中...', 'pending')
   }
   try {
     const result = await ipcRenderer.invoke('app-update-check')
     state.appUpdateInfo = result
+    logToFile(`更新检查完成: 当前版本 ${result.currentVersion || '-'}，最新版本 ${result.latestVersion || '-'}`)
     if (elements.appVersion) {
       elements.appVersion.textContent = result.currentVersion || '-'
     }
@@ -412,6 +425,7 @@ async function checkAppUpdate({ silent = false } = {}) {
     }
     return result
   } catch (error) {
+    logToFile(`检查更新失败: ${error?.message || error}`, 'error')
     if (!silent) {
       setUpdateStatus('检查失败', 'error')
     }
@@ -425,27 +439,34 @@ async function checkAppUpdate({ silent = false } = {}) {
 async function downloadAndInstallUpdate() {
   if (!state.appUpdateInfo?.hasUpdate || !state.appUpdateInfo?.asset) {
     log('暂无可更新版本。')
+    logToFile('下载更新失败：无可用更新资产。', 'error')
     return
   }
   setUpdateStatus('下载中...', 'pending')
   try {
+    logToFile(`开始下载更新: ${state.appUpdateInfo.asset.name}`)
     const download = await ipcRenderer.invoke('app-update-download', state.appUpdateInfo.asset)
     if (!download?.ok) {
       setUpdateStatus('下载失败', 'error')
       log(download?.message || '下载更新失败。', 'error')
+      logToFile(download?.message || '下载更新失败。', 'error')
       return
     }
+    logToFile(`更新下载完成: ${download.path || download.name}`)
     setUpdateStatus('正在安装更新...', 'pending')
     const installResult = await ipcRenderer.invoke('app-update-install', download)
     if (!installResult?.ok) {
       setUpdateStatus('安装失败', 'error')
       log(installResult?.message || '安装更新失败。', 'error')
+      logToFile(installResult?.message || '安装更新失败。', 'error')
       return
     }
     setUpdateStatus('正在重启...', 'pending')
+    logToFile('更新安装完成，准备重启。')
   } catch (error) {
     setUpdateStatus('更新失败', 'error')
     log('更新失败，请查看日志。', 'error')
+    logToFile(`更新失败: ${error?.message || error}`, 'error')
   }
 }
 
@@ -1367,7 +1388,20 @@ async function migrateScoopInstallPath(targetPath) {
       return
     }
   }
-  const currentPath = resolveCurrentScoopPath()
+  let currentPath = resolveCurrentScoopPath()
+  const commandPathResult = await runPowerShell(
+    'Get-Command scoop -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source',
+    { logOutput: false }
+  )
+  const commandPath = commandPathResult.stdout.trim()
+  if (commandPath) {
+    const shimRoot = path.dirname(commandPath)
+    const derivedRoot = path.dirname(shimRoot)
+    if (hasScoopAtPath(derivedRoot)) {
+      currentPath = derivedRoot
+      setScoopPath(currentPath, { persist: false })
+    }
+  }
   if (!hasScoopAtPath(currentPath)) {
     log('未检测到有效的 Scoop 安装目录，请先校准当前路径。', 'error')
     return
@@ -1515,16 +1549,24 @@ function runPowerShell(command, options = {}) {
 
     child.stdout.on('data', (data) => {
       stdout += data.toString()
-      if (!logOutput) return
       const text = data.toString().trim()
-      if (text) log(text)
+      if (!text) return
+      if (logOutput) {
+        log(text)
+      } else {
+        logToFile(text)
+      }
     })
 
     child.stderr.on('data', (data) => {
       stderr += data.toString()
-      if (!logOutput) return
       const text = data.toString().trim()
-      if (text) log(text, 'error')
+      if (!text) return
+      if (logOutput) {
+        log(text, 'error')
+      } else {
+        logToFile(text, 'error')
+      }
     })
 
     child.on('close', (code) => {
@@ -1636,10 +1678,14 @@ async function detectScoop() {
   setStatusChecking()
   const homeScoop = path.join(os.homedir(), 'scoop')
   const customScoop = normalizeScoopPath(state.scoopPath)
-  const candidatePaths = [customScoop, homeScoop].filter(Boolean)
+  const envScoop = normalizeScoopPath(process.env.SCOOP)
+  const candidatePaths = [envScoop, customScoop, homeScoop].filter(Boolean)
   const uniquePaths = [...new Set(candidatePaths.map((value) => path.resolve(value)))]
   if (uniquePaths.some((scoopPath) => hasScoopAtPath(scoopPath))) {
     setStatus(true)
+    if (envScoop && hasScoopAtPath(envScoop)) {
+      setScoopPath(envScoop, { persist: false })
+    }
     await refreshBuckets()
     await refreshInstalled()
     return true

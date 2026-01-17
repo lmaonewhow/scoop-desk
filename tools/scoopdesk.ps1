@@ -205,6 +205,9 @@ while ($true) {
     $hasGh = Resolve-GhCli
     if ($uploadOnly -and $hasGh) {
       $tag = if ($version) { "v$version" } else { $null }
+      if (-not $tag -and $artifactName -and $artifactName -match 'ScoopDesk-([0-9]+\.[0-9]+\.[0-9A-Za-z\.-]+)\.exe') {
+        $tag = "v$($Matches[1])"
+      }
       if (-not $tag -and -not $NonInteractive) {
         $tag = Read-Host "Release tag (e.g. v0.2.0)"
       }
