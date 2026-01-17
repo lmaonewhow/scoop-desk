@@ -190,6 +190,10 @@ while ($true) {
         $artifactName = $latestExe.Name
       }
     }
+    if ($NonInteractive -and $version -and $artifactName -and $artifactName -ne "ScoopDesk-$version.exe") {
+      $artifactPath = $null
+      $artifactName = $null
+    }
     $uploadOnly = $false
     if ($artifactPath -and (Test-Path $artifactPath)) {
       if ($NonInteractive) {
