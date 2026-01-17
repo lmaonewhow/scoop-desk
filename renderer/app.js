@@ -3,6 +3,7 @@ const { spawn } = require('child_process')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
+const sqlite3 = require('sqlite3').verbose()
 
 const state = {
   scoopInstalled: false,
@@ -22,8 +23,34 @@ const state = {
   activeManagers: ['scoop'],
   selectedCategories: [],
   packageManagers: [],
-  storeLayout: 'list',
-  logs: []
+  scoopPath: '',
+  gitInstalled: false,
+  appLayout: 'classic',
+  logs: [],
+  managerStats: {},
+  appDetailIndex: {},
+  storageStats: null,
+  storageStatsAt: 0,
+  storageStatsLoading: false
+}
+
+function pushBusy(label) {
+  const normalized = label || '处理中'
+  busyStack.push(normalized)
+  setBusy(true, normalized)
+}
+
+function popBusy(label) {
+  const target = label || '处理中'
+  const index = busyStack.lastIndexOf(target)
+  if (index !== -1) {
+    busyStack.splice(index, 1)
+  }
+  if (busyStack.length === 0) {
+    setBusy(false, '空闲')
+  } else {
+    setBusyMessage(busyStack[busyStack.length - 1])
+  }
 }
 
 const DEFAULT_BUCKETS = [
@@ -43,6 +70,7 @@ const DEFAULT_MANAGERS = [
     requiresScoop: true,
     search: 'scoop search {query}',
     list: 'scoop list',
+    check: 'scoop status | findstr /I /B "{name} "',
     install: 'scoop install {name}',
     uninstall: 'scoop uninstall {name}',
     parse: 'scoop'
@@ -52,6 +80,7 @@ const DEFAULT_MANAGERS = [
     label: 'Winget',
     search: 'winget search --name "{query}" --accept-source-agreements {category}',
     list: 'winget list --accept-source-agreements',
+    check: 'winget upgrade --id "{id}" --accept-source-agreements',
     install: 'winget install --id "{id}" --accept-source-agreements',
     uninstall: 'winget uninstall --id "{id}"',
     categoryFlag: '--tag "{category}"',
@@ -62,6 +91,7 @@ const DEFAULT_MANAGERS = [
     label: 'Chocolatey',
     search: 'choco search {query} --limit-output',
     list: 'choco list --local-only --limit-output',
+    check: 'choco outdated {name} --limit-output',
     install: 'choco install {name} -y',
     uninstall: 'choco uninstall {name} -y',
     parse: 'choco'
@@ -72,20 +102,139 @@ const DEFAULT_CONFIG = {
   buckets: DEFAULT_BUCKETS,
   advanced: null,
   managers: [],
+  layout: 'classic',
+  scoopPath: '',
   store: {
     manager: 'scoop',
     managers: ['scoop'],
-    categories: [],
-    layout: 'list'
+    categories: []
   }
 }
 
 const DATA_DIR = path.join(os.homedir(), '.scoopdesk')
 const CONFIG_PATH = path.join(DATA_DIR, 'config.json')
 const LOG_PATH = path.join(DATA_DIR, 'scoopdesk.log')
+const DB_PATH = path.join(DATA_DIR, 'apps.db')
 
 const taskQueue = []
 let queueRunning = false
+const busyStack = []
+
+let db = null
+function getDb() {
+  if (db) return db
+  ensureDataDir()
+  db = new sqlite3.Database(DB_PATH)
+  db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS app_details (
+      app_key TEXT PRIMARY KEY,
+      manager TEXT,
+      name TEXT,
+      detail TEXT,
+      updated_at INTEGER
+    )`)
+  })
+  return db
+}
+
+function runDb(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    getDb().run(sql, params, function (error) {
+      if (error) reject(error)
+      else resolve(this)
+    })
+  })
+}
+
+function queueCheckUpdate(item) {
+  const manager = getManagerForItem(item)
+  if (!manager) {
+    log('未选择包管理器。', 'error')
+    return
+  }
+  if (manager.requiresScoop && !requireScoop('检测更新')) return
+  const command = buildManagerCommand(manager, 'check', item)
+  const name = getDisplayName(item)
+  if (!command) {
+    log('当前包管理器未配置检测命令。', 'error')
+    return
+  }
+  enqueueTask(`[${manager.label || manager.id}] 检测更新: ${name}`, async () => {
+    log(`检测更新(${manager.label || manager.id}): ${name}`)
+    const result = await runPowerShell(command, { logOutput: false, utf8: manager.parse === 'choco' })
+    const stderr = String(result.stderr || '').trim()
+    const stdout = String(result.stdout || '').trim()
+    if (result.code !== 0) {
+      if (stderr) log(stderr, 'error')
+      log(`${name} 检测更新失败。`, 'error')
+      return
+    }
+    if (!stdout) {
+      log(`${name} 未发现可更新版本。`)
+      return
+    }
+    stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).forEach((line) => {
+      log(line)
+    })
+  })
+}
+
+function getDbRow(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    getDb().get(sql, params, (error, row) => {
+      if (error) reject(error)
+      else resolve(row || null)
+    })
+  })
+}
+
+function buildAppKey(manager, name) {
+  return `${String(manager || 'unknown').toLowerCase()}:${String(name || '').toLowerCase()}`
+}
+
+async function getAppDetailFromDb(manager, name) {
+  const key = buildAppKey(manager, name)
+  const row = await getDbRow('SELECT detail FROM app_details WHERE app_key = ?', [key])
+  if (!row?.detail) return null
+  try {
+    return JSON.parse(row.detail)
+  } catch (error) {
+    return null
+  }
+}
+
+async function hasAppDetailInDb(manager, name) {
+  const key = buildAppKey(manager, name)
+  if (state.appDetailIndex[key]) return true
+  const row = await getDbRow('SELECT 1 FROM app_details WHERE app_key = ?', [key])
+  if (row) {
+    state.appDetailIndex[key] = true
+  }
+  return !!row
+}
+
+async function saveAppDetailToDb(manager, name, detail) {
+  const key = buildAppKey(manager, name)
+  const payload = JSON.stringify({ ...detail, manager, name })
+  await runDb(
+    'INSERT OR REPLACE INTO app_details (app_key, manager, name, detail, updated_at) VALUES (?, ?, ?, ?, ?)',
+    [key, manager, name, payload, Date.now()]
+  )
+  state.appDetailIndex[key] = true
+}
+
+async function primeAppDetailIndex(items) {
+  const tasks = (items || []).map((item) => {
+    const name = getDisplayName(item)
+    const manager = item?.manager || 'scoop'
+    const key = buildAppKey(manager, name)
+    if (state.appDetailIndex[key]) return null
+    return hasAppDetailInDb(manager, name).catch(() => null)
+  }).filter(Boolean)
+  if (tasks.length) {
+    await Promise.all(tasks)
+  }
+}
 
 const elements = {
   statusText: document.getElementById('status-text'),
@@ -94,6 +243,17 @@ const elements = {
   autoInstall: document.getElementById('auto-install'),
   manualButtons: document.querySelectorAll('.step-action'),
   copyCommands: document.getElementById('copy-commands'),
+  scoopPathInput: document.getElementById('scoop-path'),
+  selectScoopPath: document.getElementById('select-scoop-path'),
+  restartHint: document.getElementById('restart-hint'),
+  restartDetect: document.getElementById('restart-detect'),
+  migrateScoopPath: document.getElementById('migrate-scoop-path'),
+  appDetailModal: document.getElementById('app-detail-modal'),
+  appDetailTitle: document.getElementById('app-detail-title'),
+  appDetailMeta: document.getElementById('app-detail-meta'),
+  appDetailNotes: document.getElementById('app-detail-notes'),
+  appDetailCommands: document.getElementById('app-detail-commands'),
+  appDetailClose: document.getElementById('app-detail-close'),
   bucketCount: document.getElementById('bucket-count'),
   installedCount: document.getElementById('installed-count'),
   installedSub: document.getElementById('installed-sub'),
@@ -102,8 +262,16 @@ const elements = {
   busyText: document.getElementById('busy-text'),
   storeNotice: document.getElementById('store-notice'),
   setupSection: document.getElementById('section-setup'),
+  storeSection: document.getElementById('section-store'),
+  migrationSection: document.getElementById('section-migration'),
+  homeSection: document.getElementById('section-home'),
   navSetup: document.getElementById('nav-setup'),
+  navHome: document.getElementById('nav-home'),
+  navMigration: document.getElementById('nav-migration'),
   navStore: document.getElementById('nav-store'),
+  bucketModal: document.getElementById('bucket-modal'),
+  bucketModalClose: document.getElementById('bucket-modal-close'),
+  openBucketModal: document.getElementById('open-bucket-modal'),
   bucketName: document.getElementById('bucket-name'),
   bucketUrl: document.getElementById('bucket-url'),
   addBucket: document.getElementById('add-bucket'),
@@ -116,8 +284,9 @@ const elements = {
   bucketPage: document.getElementById('bucket-page'),
   searchQuery: document.getElementById('search-query'),
   searchBtn: document.getElementById('search-btn'),
-  layoutList: document.getElementById('layout-list'),
-  layoutGrid: document.getElementById('layout-grid'),
+  layoutClassic: document.getElementById('layout-classic'),
+  layoutTop: document.getElementById('layout-top'),
+  layoutSplit: document.getElementById('layout-split'),
   managerTags: document.getElementById('manager-tags'),
   categoryInput: document.getElementById('category-input'),
   categoryAdd: document.getElementById('category-add'),
@@ -134,6 +303,8 @@ const elements = {
   analysisBuckets: document.getElementById('analysis-buckets'),
   analysisManagers: document.getElementById('analysis-managers'),
   analysisErrors: document.getElementById('analysis-errors'),
+  storageSummary: document.getElementById('storage-summary'),
+  storageChart: document.getElementById('storage-chart'),
   exportEnv: document.getElementById('export-env'),
   importEnv: document.getElementById('import-env'),
   applyRegistry: document.getElementById('apply-registry'),
@@ -149,15 +320,15 @@ const elements = {
   parseAdvanced: document.getElementById('parse-advanced'),
   advancedTitle: document.getElementById('advanced-title'),
   advancedSteps: document.getElementById('advanced-steps'),
-  runAdvanced: document.getElementById('run-advanced')
+  runAdvanced: document.getElementById('run-advanced'),
+  scoopPathMigrate: document.getElementById('scoop-path-migrate'),
+  selectScoopPathMigrate: document.getElementById('select-scoop-path-migrate')
 }
 
 function ensureDataDir() {
   if (fs.existsSync(DATA_DIR)) {
     const stat = fs.statSync(DATA_DIR)
-    if (stat.isDirectory()) {
-      return
-    }
+    if (stat.isDirectory()) return
     const backup = `${DATA_DIR}.bak-${Date.now()}`
     fs.renameSync(DATA_DIR, backup)
   }
@@ -208,7 +379,7 @@ function enqueueTask(label, task) {
 async function processQueue() {
   if (queueRunning) return
   queueRunning = true
-  setBusy(true, `队列处理中 (${taskQueue.length} 项)`)
+  pushBusy('队列处理中')
   while (taskQueue.length) {
     const current = taskQueue.shift()
     setBusyMessage(`队列执行: ${current.label} (剩余 ${taskQueue.length} 项)`)
@@ -219,7 +390,7 @@ async function processQueue() {
     }
   }
   queueRunning = false
-  setBusy(false, '空闲')
+  popBusy('队列处理中')
 }
 
 function updateStats() {
@@ -235,17 +406,20 @@ function updateStats() {
 
 function updateInstalledSubtitle() {
   if (!elements.installedSub) return
-  const managers = getActiveManagers()
+  const counts = Object.keys(state.managerStats || {}).length
+    ? state.managerStats
+    : state.installedApps.reduce((acc, app) => {
+        const id = app?.manager || 'unknown'
+        acc[id] = (acc[id] || 0) + 1
+        return acc
+      }, {})
+  const managers = state.packageManagers.filter((manager) => (counts[manager.id] || 0) > 0)
   if (!managers.length) {
-    elements.installedSub.textContent = '未选择来源'
+    elements.installedSub.textContent = '暂无已安装来源'
     return
   }
-  if (managers.length === 1 && managers[0].id === 'scoop') {
-    elements.installedSub.textContent = '当前 Scoop 环境'
-    return
-  }
-  const labels = managers.map((manager) => manager.label || manager.id).join(' / ')
-  elements.installedSub.textContent = `当前来源: ${labels}`
+  const labels = managers.map((manager) => `${manager.label || manager.id} ${counts[manager.id] || 0}`).join(' / ')
+  elements.installedSub.textContent = `来源: ${labels}`
 }
 
 function updateAnalytics() {
@@ -255,8 +429,16 @@ function updateAnalytics() {
   if (elements.analysisBuckets) {
     elements.analysisBuckets.textContent = state.buckets.length
   }
+  const counts = Object.keys(state.managerStats || {}).length
+    ? state.managerStats
+    : state.installedApps.reduce((acc, app) => {
+        const id = app?.manager || 'unknown'
+        acc[id] = (acc[id] || 0) + 1
+        return acc
+      }, {})
   if (elements.analysisManagers) {
-    elements.analysisManagers.textContent = getActiveManagers().length
+    const managerTotal = state.packageManagers.filter((manager) => (counts[manager.id] || 0) > 0).length
+    elements.analysisManagers.textContent = managerTotal
   }
   const errorCount = state.logs.filter((entry) => entry.type === 'error').length
   if (elements.analysisErrors) {
@@ -275,12 +457,13 @@ function updateAnalytics() {
   }
   if (elements.managerChart) {
     elements.managerChart.innerHTML = ''
-    const counts = state.installedApps.reduce((acc, app) => {
+    const fallbackCounts = state.installedApps.reduce((acc, app) => {
       const id = app?.manager || 'unknown'
       acc[id] = (acc[id] || 0) + 1
       return acc
     }, {})
-    const total = state.installedApps.length || 1
+    const counts = Object.keys(state.managerStats || {}).length ? state.managerStats : fallbackCounts
+    const total = Math.max(1, Object.values(counts).reduce((sum, value) => sum + value, 0))
     state.packageManagers.forEach((manager) => {
       const value = counts[manager.id] || 0
       const row = document.createElement('div')
@@ -293,20 +476,108 @@ function updateAnalytics() {
       elements.managerChart.appendChild(row)
     })
   }
+  refreshStorageStats()
+}
+
+function formatBytes(value) {
+  if (!value || Number.isNaN(value)) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const index = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)))
+  const size = value / Math.pow(1024, index)
+  return `${size.toFixed(size >= 100 || index === 0 ? 0 : 1)} ${units[index]}`
+}
+
+async function measurePathSize(targetPath) {
+  if (!targetPath || !fs.existsSync(targetPath)) return 0
+  const command = `((Get-ChildItem -LiteralPath ${psQuote(targetPath)} -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum)`
+  const result = await runPowerShell(command, { logOutput: false })
+  const output = String(result.stdout || '').trim()
+  const size = Number.parseInt(output, 10)
+  return Number.isFinite(size) ? size : 0
+}
+
+function renderStorageStats() {
+  if (!elements.storageSummary || !elements.storageChart) return
+  const stats = state.storageStats
+  elements.storageChart.innerHTML = ''
+  if (!stats || !stats.entries?.length) {
+    elements.storageSummary.textContent = '暂无可统计的存储信息。'
+    return
+  }
+  elements.storageSummary.textContent = `总占用 ${formatBytes(stats.total)}`
+  const total = Math.max(stats.total, 1)
+  stats.entries.forEach((entry) => {
+    const row = document.createElement('div')
+    row.className = 'chart-row'
+    row.innerHTML = `
+      <span class="chart-label">${entry.label}</span>
+      <div class="chart-bar"><div class="chart-fill" style="width: ${(entry.size / total) * 100}%"></div></div>
+      <span class="chart-value">${formatBytes(entry.size)}</span>
+    `
+    elements.storageChart.appendChild(row)
+  })
+}
+
+async function refreshStorageStats(force = false) {
+  if (!elements.storageSummary || !elements.storageChart) return
+  const now = Date.now()
+  if (!force && state.storageStatsAt && now - state.storageStatsAt < 60000) {
+    renderStorageStats()
+    return
+  }
+  if (state.storageStatsLoading) return
+  state.storageStatsLoading = true
+  elements.storageSummary.textContent = '正在统计存储占用...'
+
+  const entries = []
+  const scoopPath = getScoopPath()
+  if (fs.existsSync(scoopPath)) {
+    const size = await measurePathSize(scoopPath)
+    entries.push({ label: 'Scoop', size })
+  }
+  const chocoRoot = process.env.ChocolateyInstall || path.join(process.env.ALLUSERSPROFILE || 'C:\\ProgramData', 'chocolatey')
+  if (chocoRoot && fs.existsSync(chocoRoot)) {
+    const size = await measurePathSize(chocoRoot)
+    entries.push({ label: 'Chocolatey', size })
+  }
+  const wingetRoot = process.env.LOCALAPPDATA
+    ? path.join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Packages')
+    : ''
+  if (wingetRoot && fs.existsSync(wingetRoot)) {
+    const size = await measurePathSize(wingetRoot)
+    entries.push({ label: 'Winget', size })
+  }
+
+  const total = entries.reduce((sum, item) => sum + item.size, 0)
+  state.storageStats = { total, entries }
+  state.storageStatsAt = now
+  state.storageStatsLoading = false
+  renderStorageStats()
 }
 
 function updateLayoutButtons() {
-  elements.layoutList?.classList.toggle('active', state.storeLayout === 'list')
-  elements.layoutGrid?.classList.toggle('active', state.storeLayout === 'grid')
+  elements.layoutClassic?.classList.toggle('active', state.appLayout === 'classic')
+  elements.layoutTop?.classList.toggle('active', state.appLayout === 'top')
+  elements.layoutSplit?.classList.toggle('active', state.appLayout === 'split')
 }
 
-function setStoreLayout(layout, { persist = true } = {}) {
-  state.storeLayout = layout === 'grid' ? 'grid' : 'list'
-  elements.searchResults?.classList.toggle('grid-layout', state.storeLayout === 'grid')
+function setAppLayout(layout, { persist = true } = {}) {
+  const legacyMap = {
+    list: 'classic',
+    grid: 'top'
+  }
+  const candidate = legacyMap[layout] || layout
+  const normalized = ['classic', 'top', 'split'].includes(candidate) ? candidate : 'classic'
+  state.appLayout = normalized
+  elements.searchResults?.classList.toggle('grid-layout', state.appLayout === 'top' || state.appLayout === 'split')
+  if (elements.storeSection) {
+    elements.storeSection.dataset.layout = state.appLayout
+  }
+  document.body.dataset.appLayout = state.appLayout
   updateLayoutButtons()
   if (persist) {
     const config = readConfig()
-    config.store = { ...(config.store || {}), layout: state.storeLayout }
+    config.layout = state.appLayout
     saveConfig(config)
   }
 }
@@ -501,6 +772,7 @@ function parseDelimitedLines(lines, delimiter = /\s{2,}/) {
 function parseScoopResults(lines) {
   const apps = []
   for (const line of lines) {
+    if (/^installed(\b|\()/i.test(line)) continue
     if (line.startsWith('Results') || line.startsWith('----') || line.startsWith('Name')) continue
     const parts = line.split(/\s+/).filter(Boolean)
     if (parts[0]) {
@@ -516,7 +788,7 @@ function parseWingetResults(lines) {
   parsedLines.forEach((parts) => {
     if (parts.length < 2) return
     if (parts[0] === 'Name' || parts[0].startsWith('---') || parts[0] === '-') return
-    if (parts[0] === 'Installed' || parts[0] === '已安装') return
+    if (parts[0] === 'Installed' || parts[0] === '已安装' || /^installed(\b|\()/i.test(parts[0])) return
     const joined = parts.join(' ').toLowerCase()
     if (joined.includes('terms of transaction') || joined.includes('source requires') || joined.includes('aka.ms/microsoft-store-terms-of-transaction') || joined.includes('地理区域')) {
       return
@@ -533,11 +805,11 @@ function parseWingetResults(lines) {
 function parseChocoResults(lines) {
   const apps = []
   lines.forEach((line) => {
-    if (!line) return
-    const [name] = line.split('|')
-    if (name) {
-      apps.push({ name })
-    }
+    if (!line || !line.includes('|')) return
+    const [name] = line.split('|').map((part) => part.trim())
+    if (!name) return
+    if (name.toLowerCase().includes('chocolatey')) return
+    apps.push({ name })
   })
   return apps
 }
@@ -573,6 +845,164 @@ function getDisplayName(item) {
   return item?.name || item?.id || '未命名应用'
 }
 
+function parseScoopInfoOutput(stdout) {
+  const lines = String(stdout || '').split(/\r?\n/)
+  const notes = []
+  const commands = []
+  let inNotes = false
+  lines.forEach((line) => {
+    const trimmed = line.trim()
+    if (!trimmed) {
+      if (inNotes) {
+        inNotes = false
+      }
+      return
+    }
+    const noteMatch = trimmed.match(/^(notes?|备注)[:：]?\s*(.*)$/i)
+    if (noteMatch) {
+      inNotes = true
+      if (noteMatch[2]) {
+        notes.push(noteMatch[2].trim())
+      }
+    } else if (/^(version|license|homepage|website|description|installed|updated|manifest)\b/i.test(trimmed)) {
+      inNotes = false
+    } else if (inNotes) {
+      notes.push(trimmed)
+    }
+
+    const commandMatch = trimmed.match(/(reg\s+(?:import|add)\s+.+)$/i)
+    if (commandMatch) {
+      commands.push(commandMatch[1].trim())
+    }
+  })
+  const uniqueNotes = [...new Set(notes)].filter(Boolean)
+  const uniqueCommands = [...new Set(commands)].filter(Boolean)
+  return { notes: uniqueNotes, commands: uniqueCommands }
+}
+
+async function fetchScoopAppDetail(name) {
+  const result = await runPowerShell(`scoop info ${name}`)
+  const rawInfo = result.stdout || ''
+  const parsed = parseScoopInfoOutput(rawInfo)
+  const detail = {
+    manager: 'scoop',
+    name,
+    rawInfo,
+    notes: parsed.notes,
+    commands: parsed.commands,
+    updatedAt: Date.now()
+  }
+  await saveAppDetailToDb('scoop', name, detail)
+  return detail
+}
+
+function renderAppDetailNotes(notes = []) {
+  if (!elements.appDetailNotes) return
+  elements.appDetailNotes.innerHTML = ''
+  if (!notes.length) {
+    const li = document.createElement('li')
+    li.textContent = '暂无说明'
+    elements.appDetailNotes.appendChild(li)
+    return
+  }
+  notes.forEach((note) => {
+    const li = document.createElement('li')
+    li.textContent = note
+    elements.appDetailNotes.appendChild(li)
+  })
+}
+
+function renderAppDetailCommands(commands = []) {
+  if (!elements.appDetailCommands) return
+  elements.appDetailCommands.innerHTML = ''
+  if (!commands.length) {
+    const empty = document.createElement('div')
+    empty.className = 'helper'
+    empty.textContent = '未识别到可执行命令。'
+    elements.appDetailCommands.appendChild(empty)
+    return
+  }
+  commands.forEach((command) => {
+    const row = document.createElement('div')
+    row.className = 'command-item'
+    const code = document.createElement('code')
+    code.textContent = command
+    const button = document.createElement('button')
+    button.className = 'ghost-btn'
+    button.textContent = '执行'
+    button.addEventListener('click', () => runRegistryCommand(command))
+    row.appendChild(code)
+    row.appendChild(button)
+    elements.appDetailCommands.appendChild(row)
+  })
+}
+
+function showAppDetailModal() {
+  if (!elements.appDetailModal) return
+  elements.appDetailModal.classList.remove('hidden')
+}
+
+function closeAppDetailModal() {
+  if (!elements.appDetailModal) return
+  elements.appDetailModal.classList.add('hidden')
+}
+
+function showBucketModal() {
+  if (!elements.bucketModal) return
+  elements.bucketModal.classList.remove('hidden')
+}
+
+function closeBucketModal() {
+  if (!elements.bucketModal) return
+  elements.bucketModal.classList.add('hidden')
+}
+
+async function runRegistryCommand(command) {
+  if (!/reg\s+(import|add)\b/i.test(command)) {
+    log('仅支持执行 reg import/reg add 命令。', 'error')
+    return
+  }
+  await runTask('执行注册表命令', async () => {
+    log(`执行注册表命令: ${command}`)
+    await runPowerShell(command)
+  })
+}
+
+async function openAppDetail(item) {
+  if (!elements.appDetailModal) return
+  const name = getDisplayName(item)
+  const managerId = item?.manager || 'scoop'
+  const manager = getManagerById(managerId)
+  let detail = await getAppDetailFromDb(managerId, name)
+
+  if (!detail && managerId === 'scoop') {
+    try {
+      detail = await fetchScoopAppDetail(name)
+    } catch (error) {
+      log('读取应用详情失败，请查看日志。', 'error')
+    }
+  }
+
+  if (!detail) {
+    detail = {
+      manager: managerId,
+      name,
+      notes: managerId === 'scoop' ? [] : ['当前仅支持 Scoop 应用的详情解析。'],
+      commands: []
+    }
+  }
+
+  if (elements.appDetailTitle) {
+    elements.appDetailTitle.textContent = name
+  }
+  if (elements.appDetailMeta) {
+    elements.appDetailMeta.textContent = manager?.label || managerId
+  }
+  renderAppDetailNotes(detail.notes || [])
+  renderAppDetailCommands(detail.commands || [])
+  showAppDetailModal()
+}
+
 function queueInstallApp(item) {
   const manager = getManagerForItem(item)
   if (!manager) {
@@ -594,6 +1024,13 @@ function queueInstallApp(item) {
     log(`安装应用(${manager.label || manager.id}): ${name}`)
     await runPowerShell(command)
     await refreshInstalled()
+    if (manager.id === 'scoop') {
+      try {
+        await fetchScoopAppDetail(name)
+      } catch (error) {
+        log('应用详情解析失败，请查看日志。', 'error')
+      }
+    }
   })
 }
 
@@ -637,6 +1074,12 @@ function setBusy(isBusy, message) {
   }
   if (elements.globalStatus) {
     elements.globalStatus.textContent = state.busyMessage
+  }
+  if (!isBusy && elements.busyText) {
+    elements.busyText.textContent = '空闲'
+  }
+  if (!isBusy && elements.globalStatus) {
+    elements.globalStatus.textContent = '空闲'
   }
   updateActionState()
 }
@@ -695,6 +1138,169 @@ function requireScoop(action = '此操作') {
   return true
 }
 
+function normalizeScoopPath(value) {
+  return String(value || '').trim()
+}
+
+function setScoopPath(value, { persist = true } = {}) {
+  const normalized = normalizeScoopPath(value)
+  state.scoopPath = normalized
+  if (elements.scoopPathInput) {
+    elements.scoopPathInput.value = normalized
+  }
+  if (elements.scoopPathMigrate) {
+    elements.scoopPathMigrate.value = normalized
+  }
+  if (persist) {
+    const config = readConfig()
+    config.scoopPath = normalized
+    saveConfig(config)
+  }
+}
+
+function getScoopPath() {
+  return state.scoopPath || path.join(os.homedir(), 'scoop')
+}
+
+function getScoopShimsPath() {
+  return path.join(getScoopPath(), 'shims')
+}
+
+function hasScoopAtPath(scoopPath) {
+  if (!scoopPath) return false
+  const shimsPath = path.join(scoopPath, 'shims')
+  const appsPath = path.join(scoopPath, 'apps')
+  return fs.existsSync(shimsPath) || fs.existsSync(appsPath)
+}
+
+function psQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`
+}
+
+function joinCommands(commands) {
+  return commands.filter(Boolean).join('; ')
+}
+
+function buildScoopEnvPrefix() {
+  if (!state.scoopPath) return ''
+  const scoopPath = psQuote(state.scoopPath)
+  return `$env:SCOOP=${scoopPath}; [Environment]::SetEnvironmentVariable('SCOOP', ${scoopPath}, 'User')`
+}
+
+function buildScoopInstallCommand() {
+  const commands = []
+  if (state.scoopPath) {
+    commands.push(`New-Item -ItemType Directory -Force -Path ${psQuote(state.scoopPath)} | Out-Null`)
+  }
+  commands.push(buildScoopEnvPrefix())
+  commands.push('iwr -useb get.scoop.sh | iex')
+  return joinCommands(commands)
+}
+
+function buildScoopPathCommand() {
+  const shimsPath = psQuote(getScoopShimsPath())
+  return `[Environment]::SetEnvironmentVariable('Path', $env:Path + ';' + ${shimsPath}, 'User')`
+}
+
+function toggleRestartHint(show) {
+  if (!elements.restartHint) return
+  elements.restartHint.classList.toggle('hidden', !show)
+}
+
+function setManualStepStatus(step, status) {
+  const statusElement = document.querySelector(`.step-status[data-step="${step}"]`)
+  if (!statusElement) return
+  const labels = {
+    pending: '待执行',
+    running: '执行中',
+    done: '完成',
+    error: '失败'
+  }
+  statusElement.classList.remove('status-pending', 'status-running', 'status-done', 'status-error')
+  statusElement.classList.add(`status-${status}`)
+  statusElement.textContent = labels[status] || status
+}
+
+function resetManualStepStatuses() {
+  document.querySelectorAll('.step-status').forEach((element) => {
+    const step = element.dataset.step
+    if (step) {
+      setManualStepStatus(step, 'pending')
+    }
+  })
+}
+
+async function checkGitInstalled(force = false) {
+  if (state.gitInstalled && !force) return true
+  const result = await runPowerShell('Get-Command git -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source', { logOutput: false })
+  const installed = result.stdout.trim().length > 0
+  state.gitInstalled = installed
+  return installed
+}
+
+async function ensureGitInstalled() {
+  const installed = await checkGitInstalled()
+  if (installed) return true
+  log('未检测到 Git，准备自动安装 Git...')
+  const result = await runPowerShell('scoop install git')
+  if (result.code !== 0) {
+    log('Git 安装失败，请查看日志。', 'error')
+    return false
+  }
+  const verified = await checkGitInstalled(true)
+  if (!verified) {
+    log('Git 安装完成但仍未检测到，请重试。', 'error')
+  }
+  return verified
+}
+
+async function migrateScoopInstallPath(targetPath) {
+  const normalized = normalizeScoopPath(targetPath)
+  if (!normalized) {
+    log('请选择有效的目标路径。', 'error')
+    return
+  }
+  if (fs.existsSync(normalized)) {
+    const stat = fs.statSync(normalized)
+    if (!stat.isDirectory()) {
+      log('目标路径不是文件夹，请重新选择。', 'error')
+      return
+    }
+  } else {
+    try {
+      fs.mkdirSync(normalized, { recursive: true })
+      log('目标目录不存在，已自动创建。')
+    } catch (error) {
+      log('创建目标目录失败，请检查权限。', 'error')
+      return
+    }
+  }
+  const currentPath = getScoopPath()
+  if (path.resolve(currentPath) === path.resolve(normalized)) {
+    log('目标路径与当前路径一致，无需迁移。')
+    return
+  }
+  await runTask('迁移 Scoop 安装目录', async () => {
+    log(`准备迁移 Scoop: ${currentPath} -> ${normalized}`)
+    await runPowerShell('scoop cleanup *', { logOutput: false })
+    const commands = [
+      `if (-not (Test-Path -Path ${psQuote(normalized)})) { New-Item -ItemType Directory -Force -Path ${psQuote(normalized)} | Out-Null }`,
+      `Stop-Process -Name "scoop" -ErrorAction SilentlyContinue`,
+      `try { Move-Item -Path (Join-Path -Path ${psQuote(currentPath)} -ChildPath '*') -Destination ${psQuote(normalized)} -Force -ErrorAction Stop } catch { Write-Error $_; exit 1 }`,
+      `$env:SCOOP=${psQuote(normalized)}`,
+      `[Environment]::SetEnvironmentVariable('SCOOP', ${psQuote(normalized)}, 'User')`
+    ]
+    const result = await runPowerShell(commands.join('; '))
+    if (result.code !== 0) {
+      log('迁移失败，请查看日志。', 'error')
+      return
+    }
+    setScoopPath(normalized)
+    log('Scoop 安装目录迁移完成。')
+    await handleInstallDetection()
+  })
+}
+
 function setStatus(installed) {
   state.scoopInstalled = installed
   elements.statusText.textContent = installed ? '已检测到 Scoop 环境' : '未检测到 Scoop'
@@ -712,16 +1318,28 @@ function setStatus(installed) {
   if (elements.navSetup) {
     elements.navSetup.classList.toggle('hidden', installed)
   }
-  if (installed && elements.navSetup?.classList.contains('active')) {
+  if (elements.navMigration) {
+    elements.navMigration.classList.toggle('hidden', !installed)
+  }
+  if (elements.migrationSection) {
+    elements.migrationSection.classList.toggle('hidden', !installed)
+  }
+  if (!installed && elements.navMigration?.classList.contains('active')) {
     document.querySelectorAll('.nav-btn').forEach((btn) => btn.classList.remove('active'))
-    if (elements.navStore) {
-      elements.navStore.classList.add('active')
-    }
+    elements.navSetup?.classList.add('active')
     document.querySelectorAll('.section').forEach((section) => {
-      section.classList.toggle('active', section.id === 'section-store')
+      section.classList.toggle('active', section.id === 'section-setup')
     })
   }
-  updateStoreNotice()
+  if (installed && elements.navSetup?.classList.contains('active')) {
+    document.querySelectorAll('.nav-btn').forEach((btn) => btn.classList.remove('active'))
+    if (elements.navHome) {
+      elements.navHome.classList.add('active')
+    }
+    document.querySelectorAll('.section').forEach((section) => {
+      section.classList.toggle('active', section.id === 'section-home')
+    })
+  }
   updateActionState()
 }
 
@@ -739,30 +1357,25 @@ async function runTask(label, task, options = {}) {
     log('当前有任务正在执行，请稍候。', 'error')
     return
   }
-  const wasBusy = state.busy
-  const previousMessage = state.busyMessage
-  if (!wasBusy) {
-    setBusy(true, label)
-  } else {
-    setBusyMessage(label)
-  }
+  const taskLabel = label || '处理中'
+  pushBusy(taskLabel)
   try {
     await task()
   } catch (error) {
     log(error?.message || '执行失败，请查看日志。', 'error')
   } finally {
-    if (!wasBusy) {
-      setBusy(false, '空闲')
-    } else {
-      setBusyMessage(previousMessage)
-    }
+    popBusy(taskLabel)
   }
 }
 
 function runPowerShell(command, options = {}) {
   return new Promise((resolve) => {
-    const child = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
-      ...options
+    const { logOutput = true, utf8 = false, ...spawnOptions } = options
+    const prefix = utf8
+      ? '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); $OutputEncoding = [Console]::OutputEncoding; chcp 65001 | Out-Null; '
+      : ''
+    const child = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', `${prefix}${command}`], {
+      ...spawnOptions
     })
 
     let stdout = ''
@@ -770,12 +1383,14 @@ function runPowerShell(command, options = {}) {
 
     child.stdout.on('data', (data) => {
       stdout += data.toString()
+      if (!logOutput) return
       const text = data.toString().trim()
       if (text) log(text)
     })
 
     child.stderr.on('data', (data) => {
       stderr += data.toString()
+      if (!logOutput) return
       const text = data.toString().trim()
       if (text) log(text, 'error')
     })
@@ -790,6 +1405,8 @@ function normalizeConfig(config = {}) {
   return {
     ...DEFAULT_CONFIG,
     ...config,
+    layout: config.layout || config.store?.layout || DEFAULT_CONFIG.layout,
+    scoopPath: typeof config.scoopPath === 'string' ? config.scoopPath : DEFAULT_CONFIG.scoopPath,
     buckets: Array.isArray(config.buckets) ? config.buckets : DEFAULT_CONFIG.buckets,
     managers: Array.isArray(config.managers) ? config.managers : [],
     store: {
@@ -886,13 +1503,16 @@ function buildPackageSourceCommands(step) {
 async function detectScoop() {
   setStatusChecking()
   const homeScoop = path.join(os.homedir(), 'scoop')
-  if (fs.existsSync(homeScoop)) {
+  const customScoop = normalizeScoopPath(state.scoopPath)
+  const candidatePaths = [customScoop, homeScoop].filter(Boolean)
+  const uniquePaths = [...new Set(candidatePaths.map((value) => path.resolve(value)))]
+  if (uniquePaths.some((scoopPath) => hasScoopAtPath(scoopPath))) {
     setStatus(true)
     await refreshBuckets()
     await refreshInstalled()
     return true
   }
-  const result = await runPowerShell('Get-Command scoop -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source')
+  const result = await runPowerShell('Get-Command scoop -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source', { logOutput: false })
   const installed = result.stdout.trim().length > 0
   setStatus(installed)
   if (installed) {
@@ -902,17 +1522,46 @@ async function detectScoop() {
   return installed
 }
 
+async function handleInstallDetection() {
+  const installed = await detectScoop()
+  toggleRestartHint(!installed)
+  return installed
+}
+
 async function autoInstallScoop() {
   await runTask('安装 Scoop', async () => {
     log('开始自动安装 Scoop...')
-    const command = 'Set-ExecutionPolicy -Scope Process Bypass -Force; iwr -useb get.scoop.sh | iex'
-    const result = await runPowerShell(command)
-    if (result.code === 0) {
-      log('Scoop 安装完成。')
-      await detectScoop()
-    } else {
-      log('Scoop 安装失败，请查看日志。', 'error')
+    resetManualStepStatuses()
+    toggleRestartHint(false)
+    setManualStepStatus('policy', 'running')
+    const policyResult = await runPowerShell('Set-ExecutionPolicy -Scope Process Bypass -Force')
+    if (policyResult.code !== 0) {
+      setManualStepStatus('policy', 'error')
+      log('步骤 1 执行失败，请查看日志。', 'error')
+      return
     }
+    setManualStepStatus('policy', 'done')
+
+    setManualStepStatus('install', 'running')
+    const installResult = await runPowerShell(buildScoopInstallCommand())
+    if (installResult.code !== 0) {
+      setManualStepStatus('install', 'error')
+      log('步骤 2 执行失败，请查看日志。', 'error')
+      return
+    }
+    setManualStepStatus('install', 'done')
+
+    setManualStepStatus('path', 'running')
+    const pathResult = await runPowerShell(buildScoopPathCommand())
+    if (pathResult.code !== 0) {
+      setManualStepStatus('path', 'error')
+      log('步骤 3 执行失败，请查看日志。', 'error')
+      return
+    }
+    setManualStepStatus('path', 'done')
+
+    log('Scoop 安装步骤已完成。')
+    await handleInstallDetection()
   }, { allowWhileBusy: true })
 }
 
@@ -920,15 +1569,22 @@ async function runManualStep(step) {
   await runTask('执行手动步骤', async () => {
     const commands = {
       policy: 'Set-ExecutionPolicy -Scope Process Bypass -Force',
-      install: 'iwr -useb get.scoop.sh | iex',
-      path: "[Environment]::SetEnvironmentVariable('Path', $env:Path + ';' + $env:USERPROFILE + '\\scoop\\shims', 'User')"
+      install: buildScoopInstallCommand(),
+      path: buildScoopPathCommand()
     }
     const command = commands[step]
     if (!command) return
     log(`执行步骤：${step}`)
-    await runPowerShell(command)
-    if (step !== 'path') {
-      await detectScoop()
+    setManualStepStatus(step, 'running')
+    const result = await runPowerShell(command)
+    if (result.code !== 0) {
+      setManualStepStatus(step, 'error')
+      log('步骤执行失败，请查看日志。', 'error')
+      return
+    }
+    setManualStepStatus(step, 'done')
+    if (step !== 'policy') {
+      await handleInstallDetection()
     }
   })
 }
@@ -936,8 +1592,8 @@ async function runManualStep(step) {
 function copyManualCommands() {
   const commands = [
     'Set-ExecutionPolicy -Scope Process Bypass -Force',
-    'iwr -useb get.scoop.sh | iex',
-    "[Environment]::SetEnvironmentVariable('Path', $env:Path + ';' + $env:USERPROFILE + '\\scoop\\shims', 'User')"
+    buildScoopInstallCommand(),
+    buildScoopPathCommand()
   ].join('\n')
   clipboard.writeText(commands)
   log('已复制全部手动安装命令。')
@@ -947,6 +1603,7 @@ async function addBucket(name, url) {
   if (!name) return
   if (!requireScoop('添加 bucket')) return
   await runTask(`添加 bucket: ${name}`, async () => {
+    if (!(await ensureGitInstalled())) return
     const command = url ? `scoop bucket add ${name} ${url}` : `scoop bucket add ${name}`
     log(`添加 bucket: ${name}`)
     await runPowerShell(command)
@@ -973,7 +1630,7 @@ async function refreshBuckets() {
     return
   }
   await runTask('同步 bucket 列表', async () => {
-    const result = await runPowerShell('scoop bucket list')
+    const result = await runPowerShell('scoop bucket list', { logOutput: false })
     const lines = result.stdout.split('\n').map((line) => line.trim()).filter(Boolean)
     const buckets = []
     for (const line of lines) {
@@ -1034,6 +1691,7 @@ function renderBuckets() {
 async function addDefaultBuckets() {
   if (!requireScoop('添加默认 bucket')) return
   await runTask('添加默认 bucket 组合', async () => {
+    if (!(await ensureGitInstalled())) return
     for (const bucket of DEFAULT_BUCKETS) {
       await addBucket(bucket.name, bucket.url)
     }
@@ -1066,7 +1724,7 @@ async function searchApps(query) {
         return formatCommand(manager.search, { query, category: categoryFlag })
       }).filter(Boolean)
       for (const command of commands) {
-        const result = await runPowerShell(command)
+        const result = await runPowerShell(command, { utf8: manager.parse === 'choco' })
         const apps = parseManagerOutput(manager, result.stdout)
         apps.forEach((app) => {
           const key = `${manager.id}:${app.id || app.name}`
@@ -1076,6 +1734,7 @@ async function searchApps(query) {
         })
       }
     }
+    await primeAppDetailIndex(results)
     state.searchResults = results
     state.searchPage = 1
     state.storeMode = 'search'
@@ -1085,12 +1744,16 @@ async function searchApps(query) {
 
 function renderSearchResults() {
   elements.searchResults.innerHTML = ''
-  const items = state.storeMode === 'search' ? state.searchResults : state.installedApps
+  const baseItems = state.storeMode === 'search' ? state.searchResults : state.installedApps
+  const activeManagerIds = getActiveManagers().map((manager) => manager.id)
+  const items = state.storeMode === 'search' || !activeManagerIds.length
+    ? baseItems
+    : baseItems.filter((item) => activeManagerIds.includes(item?.manager))
   const emptyText = state.storeMode === 'search' ? '无搜索结果' : '暂无已安装应用'
   if (elements.storeListTitle) {
     elements.storeListTitle.textContent = state.storeMode === 'search' ? '搜索结果' : '已安装'
   }
-  elements.searchResults.classList.toggle('grid-layout', state.storeLayout === 'grid')
+  elements.searchResults.classList.toggle('grid-layout', state.appLayout === 'top' || state.appLayout === 'split')
   if (items.length === 0) {
     const li = document.createElement('li')
     li.textContent = emptyText
@@ -1099,7 +1762,8 @@ function renderSearchResults() {
     updateStats()
     return
   }
-  const paged = getPagedItems(items, state.searchPage, state.searchPageSize)
+  const pageSize = state.appLayout === 'split' ? 9 : state.searchPageSize
+  const paged = getPagedItems(items, state.searchPage, pageSize)
   state.searchPage = paged.page
   const totalPages = paged.totalPages
   updateSearchPagination(totalPages)
@@ -1110,62 +1774,108 @@ function renderSearchResults() {
     const manager = getManagerById(item?.manager)
     const sourceLabel = manager?.label || item?.manager || '未知来源'
     const iconLetter = (displayName || '?').slice(0, 1).toUpperCase()
+    const detailKey = buildAppKey(item?.manager || 'scoop', displayName)
+    const detailAvailable = !!state.appDetailIndex[detailKey]
     li.classList.add('app-item')
-    li.innerHTML = `
-      <div class="app-info">
-        <div class="app-icon">${iconLetter}</div>
-        <div class="app-text">
-          <span class="app-name">${displayName}</span>
-          <span class="source-tag">${sourceLabel}</span>
-        </div>
-      </div>
-      <button class="${installed ? 'ghost-btn' : 'primary-btn'}" data-action="${installed ? 'uninstall' : 'install'}">${installed ? '卸载' : '安装'}</button>
-    `
-    const button = li.querySelector('button')
-    button.addEventListener('click', async () => {
+    const info = document.createElement('div')
+    info.className = 'app-info'
+    const icon = document.createElement('div')
+    icon.className = 'app-icon'
+    icon.textContent = iconLetter
+    const text = document.createElement('div')
+    text.className = 'app-text'
+    const nameSpan = document.createElement('span')
+    nameSpan.className = 'app-name'
+    nameSpan.textContent = displayName
+    nameSpan.title = displayName
+    const tag = document.createElement('span')
+    tag.className = 'source-tag'
+    tag.textContent = sourceLabel
+    text.appendChild(nameSpan)
+    text.appendChild(tag)
+    info.appendChild(icon)
+    info.appendChild(text)
+
+    const actions = document.createElement('div')
+    actions.className = 'app-actions'
+    if (detailAvailable) {
+      const detailButton = document.createElement('button')
+      detailButton.className = 'ghost-btn'
+      detailButton.dataset.action = 'detail'
+      detailButton.textContent = '详情'
+      detailButton.addEventListener('click', async () => {
+        await openAppDetail(item)
+      })
+      actions.appendChild(detailButton)
+    }
+    if (installed) {
+      const checkButton = document.createElement('button')
+      checkButton.className = 'ghost-btn'
+      checkButton.dataset.action = 'check'
+      checkButton.textContent = '检测'
+      checkButton.addEventListener('click', () => {
+        queueCheckUpdate(item)
+      })
+      actions.appendChild(checkButton)
+    }
+    const actionButton = document.createElement('button')
+    actionButton.className = installed ? 'ghost-btn' : 'primary-btn'
+    actionButton.dataset.action = installed ? 'uninstall' : 'install'
+    actionButton.textContent = installed ? '卸载' : '安装'
+    actionButton.addEventListener('click', () => {
       if (installed) {
         queueUninstallApp(item)
       } else {
         queueInstallApp(item)
       }
     })
+    actions.appendChild(actionButton)
+    li.appendChild(info)
+    li.appendChild(actions)
     elements.searchResults.appendChild(li)
   })
   updateStats()
 }
 
 async function refreshInstalled() {
-  const managers = getActiveManagers()
-  if (!managers.length) {
-    log('未选择包管理器。', 'error')
+  const runnableManagers = state.packageManagers.filter((manager) => !(manager.requiresScoop && !state.scoopInstalled))
+  if (!runnableManagers.length) {
+    log('未配置可用的包管理器。', 'error')
     state.installedApps = []
     renderSearchResults()
-    return
-  }
-  const runnable = managers.filter((manager) => !(manager.requiresScoop && !state.scoopInstalled))
-  if (!runnable.length) {
-    state.installedApps = []
-    renderSearchResults()
+    updateAnalytics()
     return
   }
   await runTask('同步已安装列表', async () => {
+    log('开始同步已安装列表...')
     const results = []
     const seen = new Set()
-    for (const manager of runnable) {
+    const stats = {}
+    const tasks = runnableManagers.map(async (manager) => {
       const command = buildManagerCommand(manager, 'list')
-      if (!command) continue
-      const result = await runPowerShell(command)
+      if (!command) {
+        stats[manager.id] = 0
+        return
+      }
+      stats[manager.id] = 0
+      const result = await runPowerShell(command, { logOutput: false, utf8: manager.parse === 'choco' })
       const apps = parseManagerOutput(manager, result.stdout)
       apps.forEach((app) => {
         const key = `${manager.id}:${app.id || app.name}`
         if (seen.has(key)) return
         seen.add(key)
         results.push({ ...app, manager: manager.id })
+        stats[manager.id] += 1
       })
-    }
-    state.installedApps = results
+    })
+    await Promise.all(tasks)
+    await primeAppDetailIndex(results)
+    state.installedApps = runnableManagers.length ? results : []
+    state.managerStats = stats
     state.searchPage = 1
     renderSearchResults()
+    updateAnalytics()
+    log(`已同步已安装列表，共 ${state.installedApps.length} 项。`)
   }, { allowWhileBusy: true })
 }
 
@@ -1455,14 +2165,15 @@ function init() {
   const config = readConfig()
   state.buckets = config.buckets || []
   state.packageManagers = mergeManagers(config.managers)
-  state.storeLayout = config.store?.layout || 'list'
+  setScoopPath(config.scoopPath || '', { persist: false })
+  state.appLayout = config.layout || config.store?.layout || 'classic'
   const storedManagers = Array.isArray(config.store?.managers) && config.store.managers.length
     ? config.store.managers
     : (config.store?.manager ? [config.store.manager] : [])
   setActiveManagers(storedManagers, { persist: false })
   state.selectedCategories = Array.isArray(config.store?.categories) ? config.store.categories : []
   renderCategoryTags()
-  setStoreLayout(state.storeLayout, { persist: false })
+  setAppLayout(state.appLayout, { persist: false })
   if (config.advanced) {
     state.advancedConfig = config.advanced
     state.advancedStatus = config.advanced.steps?.map(() => 'pending') || []
@@ -1483,6 +2194,53 @@ function init() {
     button.addEventListener('click', () => runManualStep(button.dataset.step))
   })
   elements.copyCommands.addEventListener('click', copyManualCommands)
+  elements.appDetailClose?.addEventListener('click', closeAppDetailModal)
+  elements.appDetailModal?.addEventListener('click', (event) => {
+    if (event.target === elements.appDetailModal) {
+      closeAppDetailModal()
+    }
+  })
+  elements.openBucketModal?.addEventListener('click', async () => {
+    if (!requireScoop('打开 Bucket 管理')) return
+    showBucketModal()
+    await refreshBuckets()
+  })
+  elements.bucketModalClose?.addEventListener('click', closeBucketModal)
+  elements.bucketModal?.addEventListener('click', (event) => {
+    if (event.target === elements.bucketModal) {
+      closeBucketModal()
+    }
+  })
+  elements.restartDetect?.addEventListener('click', handleInstallDetection)
+  elements.migrateScoopPath?.addEventListener('click', async () => {
+    let targetPath = elements.scoopPathMigrate?.value?.trim()
+    if (!targetPath) {
+      targetPath = await ipcRenderer.invoke('select-directory', state.scoopPath || os.homedir())
+    }
+    if (!targetPath) return
+    await migrateScoopInstallPath(targetPath)
+  })
+  elements.selectScoopPathMigrate?.addEventListener('click', async () => {
+    const selectedPath = await ipcRenderer.invoke('select-directory', state.scoopPath || os.homedir())
+    if (selectedPath && elements.scoopPathMigrate) {
+      elements.scoopPathMigrate.value = selectedPath
+    }
+  })
+  elements.selectScoopPath?.addEventListener('click', async () => {
+    const selectedPath = await ipcRenderer.invoke('select-directory', state.scoopPath || os.homedir())
+    if (selectedPath) {
+      setScoopPath(selectedPath)
+    }
+  })
+  elements.scoopPathInput?.addEventListener('change', () => {
+    setScoopPath(elements.scoopPathInput.value)
+  })
+  elements.scoopPathInput?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      setScoopPath(elements.scoopPathInput.value)
+    }
+  })
   elements.clearLog.addEventListener('click', () => {
     state.logs = []
     elements.logOutput.innerHTML = ''
@@ -1510,8 +2268,9 @@ function init() {
       searchApps(elements.searchQuery.value.trim())
     }
   })
-  elements.layoutList?.addEventListener('click', () => setStoreLayout('list'))
-  elements.layoutGrid?.addEventListener('click', () => setStoreLayout('grid'))
+  elements.layoutClassic?.addEventListener('click', () => setAppLayout('classic'))
+  elements.layoutTop?.addEventListener('click', () => setAppLayout('top'))
+  elements.layoutSplit?.addEventListener('click', () => setAppLayout('split'))
   elements.categoryAdd?.addEventListener('click', () => {
     addCategoryTag(elements.categoryInput?.value)
     if (elements.categoryInput) {

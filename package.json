@@ -9,7 +9,9 @@
     "start": "electron .",
     "electron:build": "electron-builder"
   },
-  "dependencies": {},
+  "dependencies": {
+    "sqlite3": "^5.1.7"
+  },
   "devDependencies": {
     "electron": "^29.1.4",
     "electron-builder": "^24.13.3"

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron')
+ const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron')
 const path = require('path')
 
 let mainWindow = null
@@ -58,6 +58,18 @@ ipcMain.handle('select-open-path', async () => {
     title: '选择导入文件',
     properties: ['openFile'],
     filters: [{ name: 'JSON', extensions: ['json'] }]
+  })
+  if (result.canceled || result.filePaths.length === 0) {
+    return null
+  }
+  return result.filePaths[0]
+})
+
+ipcMain.handle('select-directory', async (event, defaultPath) => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择安装目录',
+    defaultPath: defaultPath || undefined,
+    properties: ['openDirectory', 'createDirectory']
   })
   if (result.canceled || result.filePaths.length === 0) {
     return null

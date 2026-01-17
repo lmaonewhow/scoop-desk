@@ -32,27 +32,11 @@
         </div>
       </header>
 
-      <section class="overview">
-        <div class="stat-card">
-          <p>Bucket 数量</p>
-          <div class="stat-value" id="bucket-count">0</div>
-          <span class="stat-sub">已同步的 bucket</span>
-        </div>
-        <div class="stat-card">
-          <p>已安装应用</p>
-          <div class="stat-value" id="installed-count">0</div>
-          <span class="stat-sub" id="installed-sub">当前 Scoop 环境</span>
-        </div>
-        <div class="stat-card wide">
-          <p>执行状态</p>
-          <div class="stat-value" id="global-status">空闲</div>
-          <span class="stat-sub">任务执行与日志同步</span>
-        </div>
-      </section>
-
       <div class="app-body">
         <nav class="sidebar">
-          <button class="nav-btn active" id="nav-setup" data-target="setup" data-keep-active="true">安装引导</button>
+          <button class="nav-btn active" id="nav-home" data-target="home" data-keep-active="true">首页</button>
+          <button class="nav-btn" id="nav-setup" data-target="setup" data-keep-active="true">安装引导</button>
+          <button class="nav-btn hidden" id="nav-migration" data-target="migration" data-keep-active="true">迁移安装</button>
           <button class="nav-btn" id="nav-store" data-target="store" data-keep-active="true">软件商店</button>
           <button class="nav-btn" data-target="analytics" data-keep-active="true">数据分析</button>
           <button class="nav-btn" data-target="settings" data-keep-active="true">设置</button>
@@ -61,13 +45,54 @@
         </nav>
 
         <main class="content">
-          <section id="section-setup" class="section active">
+          <section id="section-home" class="section active">
+            <div class="section-header">
+              <h2>首页仪表盘</h2>
+              <p>聚合当前 Scoop 环境的关键状态与执行概览。</p>
+            </div>
+            <div class="overview dashboard">
+              <div class="stat-card">
+                <p>Bucket 数量</p>
+                <div class="stat-value" id="bucket-count">0</div>
+                <span class="stat-sub">已同步的 bucket</span>
+              </div>
+              <div class="stat-card">
+                <p>已安装应用</p>
+                <div class="stat-value" id="installed-count">0</div>
+                <span class="stat-sub" id="installed-sub">当前 Scoop 环境</span>
+              </div>
+              <div class="stat-card wide">
+                <p>执行状态</p>
+                <div class="stat-value" id="global-status">空闲</div>
+                <span class="stat-sub">任务执行与日志同步</span>
+              </div>
+            </div>
+          </section>
+
+          <section id="section-setup" class="section">
             <div class="section-header">
               <h2>检测与安装 Scoop</h2>
               <p>未安装 Scoop 时，这里提供自动和手动两种方案。</p>
             </div>
 
+            <div class="notice hidden" id="restart-hint">
+              <div>
+                <strong>安装完成但仍未检测到 Scoop？</strong>
+                <p>环境变量需要重启终端或应用后生效，重启后点击重新检测。</p>
+              </div>
+              <button class="ghost-btn" id="restart-detect">重新检测</button>
+            </div>
+
             <div class="grid two-columns">
+              <div class="card full">
+                <h3>安装路径</h3>
+                <p>请先选择 Scoop 安装位置，避免默认安装到 C 盘。</p>
+                <div class="inline-form">
+                  <input id="scoop-path" placeholder="例如 D:\\Apps\\Scoop" />
+                  <button class="ghost-btn" id="select-scoop-path">选择路径</button>
+                </div>
+                <div class="helper">路径会保存到配置文件，自动安装与手动步骤都会使用该路径。</div>
+              </div>
               <div class="card">
                 <h3>自动安装</h3>
                 <p>适合新手或希望一键完成安装的场景。</p>
@@ -84,7 +109,10 @@
                         <strong>允许脚本执行</strong>
                         <p>设置 PowerShell 为 RemoteSigned，以便执行安装脚本。</p>
                       </div>
-                      <button class="primary-btn step-action" data-step="policy" data-disable-when-scoop="true">执行步骤 1</button>
+                      <div class="step-actions">
+                        <span class="status-pill status-pending step-status" data-step="policy">待执行</span>
+                        <button class="primary-btn step-action" data-step="policy" data-disable-when-scoop="true">执行步骤 1</button>
+                      </div>
                     </li>
                     <li>
                       <span class="step-index">2</span>
@@ -92,7 +120,10 @@
                         <strong>执行 Scoop 安装脚本</strong>
                         <p>使用官方推荐脚本完成安装。</p>
                       </div>
-                      <button class="primary-btn step-action" data-step="install" data-disable-when-scoop="true">执行步骤 2</button>
+                      <div class="step-actions">
+                        <span class="status-pill status-pending step-status" data-step="install">待执行</span>
+                        <button class="primary-btn step-action" data-step="install" data-disable-when-scoop="true">执行步骤 2</button>
+                      </div>
                     </li>
                     <li>
                       <span class="step-index">3</span>
@@ -100,7 +131,10 @@
                         <strong>刷新环境变量</strong>
                         <p>将 Scoop 的 shims 路径写入注册表，确保全局可用。</p>
                       </div>
-                      <button class="primary-btn step-action" data-step="path" data-disable-when-scoop="true">执行步骤 3</button>
+                      <div class="step-actions">
+                        <span class="status-pill status-pending step-status" data-step="path">待执行</span>
+                        <button class="primary-btn step-action" data-step="path" data-disable-when-scoop="true">执行步骤 3</button>
+                      </div>
                     </li>
                   </ol>
                   <div class="manual-actions">
@@ -111,16 +145,36 @@
             </div>
           </section>
 
+          <section id="section-migration" class="section hidden">
+            <div class="section-header">
+              <h2>迁移 Scoop 安装</h2>
+              <p>安装完成后可将 Scoop 目录迁移到新的磁盘位置。</p>
+            </div>
+
+            <div class="grid two-columns">
+              <div class="card full">
+                <h3>迁移安装目录</h3>
+                <p>选择新的安装路径，系统会自动更新环境变量并重新检测。</p>
+                <div class="inline-form">
+                  <input id="scoop-path-migrate" placeholder="例如 D:\\Apps\\Scoop" />
+                  <button class="ghost-btn" id="select-scoop-path-migrate">选择路径</button>
+                  <button class="primary-btn" id="migrate-scoop-path" data-requires-scoop="true">开始迁移</button>
+                </div>
+                <div class="helper">迁移过程会移动当前目录下的 apps、shims 等数据。</div>
+              </div>
+            </div>
+          </section>
+
           <section id="section-settings" class="section">
             <div class="section-header">
               <h2>设置</h2>
-              <p>调整软件商店的显示方式与偏好。</p>
+              <p>调整应用整体布局与显示偏好。</p>
             </div>
 
             <div class="grid two-columns">
               <div class="card">
                 <h3>界面布局</h3>
-                <p>选择应用列表的展示方式。</p>
+                <p>选择应用整体布局风格。</p>
                 <div class="settings-row">
                   <div class="layout-toggle">
                     <span class="toolbar-label">布局</span>
@@ -149,6 +203,11 @@
                 <h3>日志概览</h3>
                 <div class="analysis-summary" id="log-summary"></div>
                 <ul class="list compact" id="activity-list"></ul>
+              </div>
+              <div class="card">
+                <h3>存储占用</h3>
+                <div class="analysis-summary" id="storage-summary">正在统计存储占用...</div>
+                <div class="chart-list" id="storage-chart"></div>
               </div>
               <div class="card full">
                 <h3>环境概览</h3>
@@ -186,39 +245,23 @@
             </div>
 
             <div class="grid two-columns">
-              <div class="card bucket-card">
-                <h3>Bucket 管理</h3>
-                <div class="inline-form">
-                  <input type="text" id="bucket-name" placeholder="Bucket 名称（必填）" />
-                  <input type="text" id="bucket-url" placeholder="Bucket 地址（可选）" />
-                  <button class="primary-btn" id="add-bucket" data-requires-scoop="true">添加</button>
-                </div>
-                <div class="bucket-actions">
-                  <button class="ghost-btn" id="add-default-buckets" data-requires-scoop="true">添加默认 Bucket 组合</button>
-                  <button class="ghost-btn" id="reload-buckets" data-requires-scoop="true">刷新 Bucket 列表</button>
-                  <button class="ghost-btn" id="refresh-installed" data-requires-scoop="true">刷新已安装</button>
-                </div>
-                <ul class="list" id="bucket-list"></ul>
-                <div class="pagination">
-                  <button class="ghost-btn" id="bucket-prev">上一页</button>
-                  <span id="bucket-page">1 / 1</span>
-                  <button class="ghost-btn" id="bucket-next">下一页</button>
-                </div>
-              </div>
-              <div class="card store-card">
+              <div class="card store-card full">
                 <h3>应用搜索</h3>
                 <div class="store-card-body">
-                  <div class="store-filters">
-                    <div class="inline-form">
+                  <div class="store-search">
+                    <div class="inline-form store-search-form">
                       <input type="text" id="search-query" placeholder="输入应用名称" />
                       <button class="primary-btn" id="search-btn">搜索</button>
+                      <button class="ghost-btn" id="open-bucket-modal" data-requires-scoop="true">Bucket 管理</button>
                     </div>
-                    <div class="filter-row">
+                  </div>
+                  <div class="store-body">
+                    <div class="store-filters">
                       <div>
                         <label>包管理器</label>
                         <div class="tag-group" id="manager-tags"></div>
                       </div>
-                      <div>
+                      <div class="filter-category">
                         <label>分类</label>
                         <div class="tag-input">
                           <input type="text" id="category-input" placeholder="输入标签后回车" />
@@ -227,16 +270,16 @@
                         <div class="tag-group" id="category-tags"></div>
                       </div>
                     </div>
-                  </div>
-                  <div class="store-results">
-                    <div class="store-columns single">
-                      <div>
-                        <h4 id="store-list-title">已安装</h4>
-                        <ul class="list" id="search-results"></ul>
-                        <div class="pagination">
-                          <button class="ghost-btn" id="search-prev">上一页</button>
-                          <span id="search-page">1 / 1</span>
-                          <button class="ghost-btn" id="search-next">下一页</button>
+                    <div class="store-results">
+                      <div class="store-columns single">
+                        <div>
+                          <h4 id="store-list-title">已安装</h4>
+                          <ul class="list" id="search-results"></ul>
+                          <div class="pagination">
+                            <button class="ghost-btn" id="search-prev">上一页</button>
+                            <span id="search-page">1 / 1</span>
+                            <button class="ghost-btn" id="search-next">下一页</button>
+                          </div>
                         </div>
                       </div>
                     </div>
@@ -317,6 +360,58 @@
         </div>
         <div id="log-output" class="log-lines"></div>
       </section>
+
+      <div class="modal hidden" id="bucket-modal">
+        <div class="modal-content">
+          <div class="modal-header">
+            <div>
+              <h3>Bucket 管理</h3>
+              <p class="modal-sub">管理 Scoop bucket 列表与同步操作。</p>
+            </div>
+            <button class="ghost-btn" id="bucket-modal-close">关闭</button>
+          </div>
+          <div class="modal-body">
+            <div class="inline-form">
+              <input type="text" id="bucket-name" placeholder="Bucket 名称（必填）" />
+              <input type="text" id="bucket-url" placeholder="Bucket 地址（可选）" />
+              <button class="primary-btn" id="add-bucket" data-requires-scoop="true">添加</button>
+            </div>
+            <div class="bucket-actions">
+              <button class="ghost-btn" id="add-default-buckets" data-requires-scoop="true">添加默认 Bucket 组合</button>
+              <button class="ghost-btn" id="reload-buckets" data-requires-scoop="true">刷新 Bucket 列表</button>
+              <button class="ghost-btn" id="refresh-installed" data-requires-scoop="true">刷新已安装</button>
+            </div>
+            <ul class="list" id="bucket-list"></ul>
+            <div class="pagination">
+              <button class="ghost-btn" id="bucket-prev">上一页</button>
+              <span id="bucket-page">1 / 1</span>
+              <button class="ghost-btn" id="bucket-next">下一页</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal hidden" id="app-detail-modal">
+        <div class="modal-content">
+          <div class="modal-header">
+            <div>
+              <h3 id="app-detail-title">应用详情</h3>
+              <div class="modal-meta" id="app-detail-meta">Scoop</div>
+            </div>
+            <button class="ghost-btn" id="app-detail-close">关闭</button>
+          </div>
+          <div class="modal-body">
+            <div class="modal-section">
+              <h4>安装后提示</h4>
+              <ul class="list compact" id="app-detail-notes"></ul>
+            </div>
+            <div class="modal-section">
+              <h4>可执行命令</h4>
+              <div class="command-list" id="app-detail-commands"></div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <script src="./app.js"></script>
