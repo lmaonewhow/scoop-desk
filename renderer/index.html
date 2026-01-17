@@ -185,6 +185,27 @@
                 </div>
                 <div class="helper">切换后会自动保存到配置文件。</div>
               </div>
+              <div class="card">
+                <h3>应用更新</h3>
+                <p>检查 ScoopDesk 是否有可用的新版本。</p>
+                <div class="settings-row">
+                  <div class="layout-toggle">
+                    <span class="toolbar-label">当前版本</span>
+                    <span id="app-version">-</span>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="layout-toggle">
+                    <span class="toolbar-label">更新状态</span>
+                    <span id="app-update-status">未检查</span>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <button class="ghost-btn" id="app-update-check">检查更新</button>
+                  <button class="primary-btn" id="app-update-install" disabled>立即更新</button>
+                </div>
+                <div class="helper" id="app-update-notes">检测到更新后会自动下载并替换应用。</div>
+              </div>
             </div>
           </section>
 

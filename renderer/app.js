@@ -31,7 +31,8 @@ const state = {
   appDetailIndex: {},
   storageStats: null,
   storageStatsAt: 0,
-  storageStatsLoading: false
+  storageStatsLoading: false,
+  appUpdateInfo: null
 }
 
 function pushBusy(label) {
@@ -314,6 +315,11 @@ const elements = {
   clearRestore: document.getElementById('clear-restore'),
   logOutput: document.getElementById('log-output'),
   clearLog: document.getElementById('clear-log'),
+  appVersion: document.getElementById('app-version'),
+  appUpdateStatus: document.getElementById('app-update-status'),
+  appUpdateNotes: document.getElementById('app-update-notes'),
+  appUpdateCheck: document.getElementById('app-update-check'),
+  appUpdateInstall: document.getElementById('app-update-install'),
   loadAdvanced: document.getElementById('load-advanced'),
   useTemplate: document.getElementById('use-template'),
   advancedInput: document.getElementById('advanced-input'),
@@ -365,6 +371,81 @@ function log(message, type = 'info') {
     console.error(message)
   } else {
     console.log(message)
+  }
+}
+
+function setUpdateStatus(message, type = 'info') {
+  if (elements.appUpdateStatus) {
+    elements.appUpdateStatus.textContent = message
+    elements.appUpdateStatus.dataset.status = type
+  }
+}
+
+async function checkAppUpdate({ silent = false } = {}) {
+  if (!silent) {
+    setUpdateStatus('检查中...', 'pending')
+  }
+  try {
+    const result = await ipcRenderer.invoke('app-update-check')
+    state.appUpdateInfo = result
+    if (elements.appVersion) {
+      elements.appVersion.textContent = result.currentVersion || '-'
+    }
+    if (result.hasUpdate) {
+      setUpdateStatus(`发现新版本 ${result.latestVersion}`, 'warn')
+      if (elements.appUpdateNotes) {
+        elements.appUpdateNotes.textContent = result.notes ? `更新说明: ${result.notes}` : '已检测到新版本，可立即更新。'
+      }
+      if (elements.appUpdateInstall) {
+        elements.appUpdateInstall.disabled = false
+      }
+    } else {
+      if (!silent) {
+        setUpdateStatus('已是最新版本', 'ok')
+      }
+      if (elements.appUpdateNotes) {
+        elements.appUpdateNotes.textContent = '暂无可用更新。'
+      }
+      if (elements.appUpdateInstall) {
+        elements.appUpdateInstall.disabled = true
+      }
+    }
+    return result
+  } catch (error) {
+    if (!silent) {
+      setUpdateStatus('检查失败', 'error')
+    }
+    if (elements.appUpdateNotes) {
+      elements.appUpdateNotes.textContent = '无法获取更新信息，请检查网络或仓库设置。'
+    }
+    return null
+  }
+}
+
+async function downloadAndInstallUpdate() {
+  if (!state.appUpdateInfo?.hasUpdate || !state.appUpdateInfo?.asset) {
+    log('暂无可更新版本。')
+    return
+  }
+  setUpdateStatus('下载中...', 'pending')
+  try {
+    const download = await ipcRenderer.invoke('app-update-download', state.appUpdateInfo.asset)
+    if (!download?.ok) {
+      setUpdateStatus('下载失败', 'error')
+      log(download?.message || '下载更新失败。', 'error')
+      return
+    }
+    setUpdateStatus('正在安装更新...', 'pending')
+    const installResult = await ipcRenderer.invoke('app-update-install', download)
+    if (!installResult?.ok) {
+      setUpdateStatus('安装失败', 'error')
+      log(installResult?.message || '安装更新失败。', 'error')
+      return
+    }
+    setUpdateStatus('正在重启...', 'pending')
+  } catch (error) {
+    setUpdateStatus('更新失败', 'error')
+    log('更新失败，请查看日志。', 'error')
   }
 }
 
@@ -1162,6 +1243,17 @@ function getScoopPath() {
   return state.scoopPath || path.join(os.homedir(), 'scoop')
 }
 
+function resolveCurrentScoopPath() {
+  const candidates = [
+    normalizeScoopPath(process.env.SCOOP),
+    normalizeScoopPath(state.scoopPath),
+    path.join(os.homedir(), 'scoop')
+  ].filter(Boolean)
+  const unique = [...new Set(candidates.map((value) => path.resolve(value)))]
+  const existing = unique.find((value) => hasScoopAtPath(value))
+  return existing || candidates[0] || path.join(os.homedir(), 'scoop')
+}
+
 function getScoopShimsPath() {
   return path.join(getScoopPath(), 'shims')
 }
@@ -1275,17 +1367,41 @@ async function migrateScoopInstallPath(targetPath) {
       return
     }
   }
-  const currentPath = getScoopPath()
+  const currentPath = resolveCurrentScoopPath()
+  if (!hasScoopAtPath(currentPath)) {
+    log('未检测到有效的 Scoop 安装目录，请先校准当前路径。', 'error')
+    return
+  }
   if (path.resolve(currentPath) === path.resolve(normalized)) {
     log('目标路径与当前路径一致，无需迁移。')
     return
   }
   await runTask('迁移 Scoop 安装目录', async () => {
+    log('导出当前 Scoop 环境清单...')
+    await refreshBuckets()
+    await refreshInstalled()
+    const migrationPlan = {
+      exportedAt: new Date().toISOString(),
+      buckets: [...state.buckets],
+      apps: state.installedApps.map((app) => getDisplayName(app))
+    }
+    const tempPlanPath = path.join(os.tmpdir(), `scoopdesk-migrate-${Date.now()}.json`)
+    fs.writeFileSync(tempPlanPath, JSON.stringify(migrationPlan, null, 2))
+    log(`已导出迁移清单到 ${tempPlanPath}`)
+
+    if (migrationPlan.apps.length) {
+      log(`开始卸载应用 (${migrationPlan.apps.length} 项)...`)
+      for (const app of migrationPlan.apps) {
+        await runPowerShell(`scoop uninstall ${app}`)
+      }
+      log('应用卸载完成。')
+    }
     log(`准备迁移 Scoop: ${currentPath} -> ${normalized}`)
     await runPowerShell('scoop cleanup *', { logOutput: false })
     const commands = [
       `if (-not (Test-Path -Path ${psQuote(normalized)})) { New-Item -ItemType Directory -Force -Path ${psQuote(normalized)} | Out-Null }`,
       `Stop-Process -Name "scoop" -ErrorAction SilentlyContinue`,
+      `$scoopRoot = ${psQuote(currentPath)}; Get-Process | Where-Object { $_.Path -and $_.Path -like ($scoopRoot + '\\*') } | Stop-Process -Force -ErrorAction SilentlyContinue`,
       `try { Move-Item -Path (Join-Path -Path ${psQuote(currentPath)} -ChildPath '*') -Destination ${psQuote(normalized)} -Force -ErrorAction Stop } catch { Write-Error $_; exit 1 }`,
       `$env:SCOOP=${psQuote(normalized)}`,
       `[Environment]::SetEnvironmentVariable('SCOOP', ${psQuote(normalized)}, 'User')`
@@ -1297,7 +1413,23 @@ async function migrateScoopInstallPath(targetPath) {
     }
     setScoopPath(normalized)
     log('Scoop 安装目录迁移完成。')
+
+    if (migrationPlan.buckets.length) {
+      log(`恢复 buckets (${migrationPlan.buckets.length} 个)...`)
+      for (const bucket of migrationPlan.buckets) {
+        if (bucket?.name) {
+          await addBucket(bucket.name, bucket.url)
+        }
+      }
+    }
+    if (migrationPlan.apps.length) {
+      log(`恢复应用安装 (${migrationPlan.apps.length} 项)...`)
+      for (const app of migrationPlan.apps) {
+        await runPowerShell(`scoop install ${app}`)
+      }
+    }
     await handleInstallDetection()
+    log('迁移与恢复完成。')
   })
 }
 
@@ -2187,6 +2319,18 @@ function init() {
   updateAdvancedUI()
   updateStats()
   updateActionState()
+
+  if (elements.appVersion) {
+    elements.appVersion.textContent = process.env.npm_package_version || '-'
+  }
+  setUpdateStatus('未检查')
+  elements.appUpdateCheck?.addEventListener('click', () => {
+    checkAppUpdate()
+  })
+  elements.appUpdateInstall?.addEventListener('click', () => {
+    downloadAndInstallUpdate()
+  })
+  checkAppUpdate({ silent: true })
 
   elements.refreshStatus.addEventListener('click', detectScoop)
   elements.autoInstall.addEventListener('click', autoInstallScoop)
