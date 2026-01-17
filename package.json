@@ -1,6 +1,6 @@
 {
   "name": "scoop-desk",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Scoop 桌面商店与环境恢复工具",
   "author": "ScoopDesk Team",
   "main": "electron/main.js",

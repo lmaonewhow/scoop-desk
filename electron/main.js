@@ -7,6 +7,48 @@ const os = require('os')
 let mainWindow = null
 const UPDATE_REPO = { owner: 'lmaonewhow', repo: 'scoop-desk' }
 let cachedRelease = null
+const DATA_DIR = path.join(os.homedir(), '.scoopdesk')
+const CONFIG_PATH = path.join(DATA_DIR, 'config.json')
+
+function ensureDataDir() {
+  if (fs.existsSync(DATA_DIR)) {
+    const stat = fs.statSync(DATA_DIR)
+    if (stat.isDirectory()) return
+    const backup = `${DATA_DIR}.bak-${Date.now()}`
+    fs.renameSync(DATA_DIR, backup)
+  }
+  fs.mkdirSync(DATA_DIR, { recursive: true })
+}
+
+function readConfigFile() {
+  try {
+    if (!fs.existsSync(CONFIG_PATH)) return {}
+    const raw = fs.readFileSync(CONFIG_PATH, 'utf8')
+    if (!raw) return {}
+    return JSON.parse(raw)
+  } catch (error) {
+    return {}
+  }
+}
+
+function writeConfigFile(config) {
+  ensureDataDir()
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8')
+}
+
+function updateConfigFile(patch) {
+  const current = readConfigFile()
+  const next = {
+    ...current,
+    ...patch,
+    update: {
+      ...(current.update || {}),
+      ...(patch.update || {})
+    }
+  }
+  writeConfigFile(next)
+  return next
+}
 
 function compareVersions(current, latest) {
   const toParts = (value) => String(value || '').split('.').map((part) => parseInt(part, 10) || 0)
@@ -89,6 +131,43 @@ Start-Process -FilePath $target
   child.unref()
 }
 
+function recordAppStart() {
+  updateConfigFile({
+    update: {
+      lastExePath: app.getPath('exe'),
+      lastStartAt: new Date().toISOString()
+    }
+  })
+}
+
+async function handlePendingUpdate() {
+  const config = readConfigFile()
+  const pending = config.update?.pendingUpdate
+  if (!pending) return false
+  const sourcePath = pending.sourcePath
+  const targetPath = pending.targetPath || app.getPath('exe')
+  if (sourcePath && fs.existsSync(sourcePath)) {
+    scheduleUpdateInstall(sourcePath, targetPath)
+    updateConfigFile({
+      update: {
+        pendingUpdate: null,
+        lastUpdateAttemptAt: new Date().toISOString()
+      }
+    })
+    setTimeout(() => {
+      app.quit()
+    }, 200)
+    return true
+  }
+  updateConfigFile({
+    update: {
+      pendingUpdate: null,
+      lastUpdateResolvedAt: new Date().toISOString()
+    }
+  })
+  return false
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1180,
@@ -111,7 +190,10 @@ function createWindow() {
   })
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  recordAppStart()
+  const handled = await handlePendingUpdate()
+  if (handled) return
   createWindow()
 
   app.on('activate', () => {
@@ -194,25 +276,42 @@ ipcMain.handle('app-update-check', async () => {
 })
 
 ipcMain.handle('app-update-download', async (event, payload = {}) => {
-  const assetUrl = payload.url || cachedRelease?.assets?.find((item) => item?.browser_download_url)?.browser_download_url
-  const assetName = payload.name || cachedRelease?.assets?.find((item) => item?.name)?.name || `ScoopDesk-${Date.now()}.exe`
-  if (!assetUrl) {
-    return { ok: false, message: 'No release asset available.' }
+  try {
+    const assetUrl = payload.url || cachedRelease?.assets?.find((item) => item?.browser_download_url)?.browser_download_url
+    const assetName = payload.name || cachedRelease?.assets?.find((item) => item?.name)?.name || `ScoopDesk-${Date.now()}.exe`
+    if (!assetUrl) {
+      return { ok: false, message: 'No release asset available.' }
+    }
+    const tempPath = path.join(os.tmpdir(), assetName)
+    await downloadFile(assetUrl, tempPath)
+    return { ok: true, path: tempPath, name: assetName }
+  } catch (error) {
+    return { ok: false, message: error?.message || 'Download failed.' }
   }
-  const tempPath = path.join(os.tmpdir(), assetName)
-  await downloadFile(assetUrl, tempPath)
-  return { ok: true, path: tempPath, name: assetName }
 })
 
 ipcMain.handle('app-update-install', async (event, payload = {}) => {
-  const sourcePath = payload.path
-  if (!sourcePath || !fs.existsSync(sourcePath)) {
-    return { ok: false, message: 'Update file not found.' }
+  try {
+    const sourcePath = payload.path
+    if (!sourcePath || !fs.existsSync(sourcePath)) {
+      return { ok: false, message: 'Update file not found.' }
+    }
+    const targetPath = app.getPath('exe')
+    updateConfigFile({
+      update: {
+        pendingUpdate: {
+          sourcePath,
+          targetPath,
+          requestedAt: new Date().toISOString()
+        }
+      }
+    })
+    scheduleUpdateInstall(sourcePath, targetPath)
+    setTimeout(() => {
+      app.quit()
+    }, 500)
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, message: error?.message || 'Update install failed.' }
   }
-  const targetPath = app.getPath('exe')
-  scheduleUpdateInstall(sourcePath, targetPath)
-  setTimeout(() => {
-    app.quit()
-  }, 500)
-  return { ok: true }
 })

@@ -1414,21 +1414,25 @@ async function migrateScoopInstallPath(targetPath) {
     log('导出当前 Scoop 环境清单...')
     await refreshBuckets()
     await refreshInstalled()
+    const scoopApps = state.installedApps
+      .filter((app) => app?.manager === 'scoop')
+      .map((app) => app?.name || app?.id)
+      .filter(Boolean)
     const migrationPlan = {
       exportedAt: new Date().toISOString(),
       buckets: [...state.buckets],
-      apps: state.installedApps.map((app) => getDisplayName(app))
+      apps: scoopApps
     }
     const tempPlanPath = path.join(os.tmpdir(), `scoopdesk-migrate-${Date.now()}.json`)
     fs.writeFileSync(tempPlanPath, JSON.stringify(migrationPlan, null, 2))
     log(`已导出迁移清单到 ${tempPlanPath}`)
 
     if (migrationPlan.apps.length) {
-      log(`开始卸载应用 (${migrationPlan.apps.length} 项)...`)
+      log(`开始卸载 Scoop 应用 (${migrationPlan.apps.length} 项)...`)
       for (const app of migrationPlan.apps) {
-        await runPowerShell(`scoop uninstall ${app}`)
+        await runPowerShell(`scoop uninstall ${psQuote(app)}`)
       }
-      log('应用卸载完成。')
+      log('Scoop 应用卸载完成。')
     }
     log(`准备迁移 Scoop: ${currentPath} -> ${normalized}`)
     await runPowerShell('scoop cleanup *', { logOutput: false })
@@ -1457,9 +1461,9 @@ async function migrateScoopInstallPath(targetPath) {
       }
     }
     if (migrationPlan.apps.length) {
-      log(`恢复应用安装 (${migrationPlan.apps.length} 项)...`)
+      log(`恢复 Scoop 应用安装 (${migrationPlan.apps.length} 项)...`)
       for (const app of migrationPlan.apps) {
-        await runPowerShell(`scoop install ${app}`)
+        await runPowerShell(`scoop install ${psQuote(app)}`)
       }
     }
     await handleInstallDetection()
